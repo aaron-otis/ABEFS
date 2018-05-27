@@ -4,6 +4,7 @@ from charm.adapters.abenc_adapt_hybrid import HybridABEnc
 from charm.core.engine.util import objectToBytes, bytesToObject
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidTag
 from hashlib import sha256
 import os
 
@@ -36,7 +37,7 @@ class ABECrypto:
         try:
             g = self._decrypt(cp_key, encrypted_aes_key)
         except:
-            print("Unable to decrypt AES key")
+            print("[ERROR] Unable to decrypt AES key")
             return None
 
         iv = os.urandom(16)
@@ -54,7 +55,7 @@ class ABECrypto:
         try:
             g = self._decrypt(cp_key, encrypted_aes_key)
         except:
-            print("Unable to decrypt AES key")
+            print("[ERROR] Unable to decrypt AES key")
             return None
 
         decryptor = Cipher(algorithms.AES(sha256(self.toBytes(g)).digest()),
@@ -67,7 +68,7 @@ class ABECrypto:
         try:
             msg = decryptor.update(ciphertext) + decryptor.finalize()
         except InvalidTag:
-            print("Received invalid tag")
+            print("[ERROR] Received invalid tag")
             return None
 
         return msg
