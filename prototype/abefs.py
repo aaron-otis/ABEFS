@@ -7,18 +7,7 @@ from pwd import getpwuid
 from json import dumps, loads
 from math import ceil
 
-# Representation of a file with ABE metadata. Uses a hybrid encryption 
-# scheme to derive an AES key from a random group element.
-class ABEFile:
-    def __init__(self, ciphertext):
-        self.abe_metadata = ciphertext["c1"]
-        self.aes_metadata = ciphertext["c2"]
-        self.aes_metadata["msg"] = loads(self.aes_metadata["msg"])
-# BEGIN DEBUG
-        #for k, v in self.aes_metadata.items():
-        #    printDebug("__init__", "{}: '{}'".format(k, v))
-        #    print
-# END DEBUG
+DEBUG = True
 
 # FUSE class.
 class ABEFS(Operations):
@@ -27,7 +16,6 @@ class ABEFS(Operations):
         self._abe = ABECrypto()
         self._user_cache = {}
         self._file_cache = {}
-        self._header_len = 4096 # TODO: Use a variable header length per file.
 
     # Creates a path relative to the specified root.
     def _full_path(self, path):
@@ -55,13 +43,17 @@ class ABEFS(Operations):
     def _read_metadata(self, fd):
         os.lseek(fd, 0, os.SEEK_SET)
 
+        # Read length of CP-ABE header.
+        abe_header_len = int.from_bytes(os.read(fd, 8), byteorder = "big")
+        printDebug("_read_metadata", "header length: {}".format(abe_header_len))
+
         # Read CP-ABE header data.
-        raw_bytes = os.read(fd, self._header_len).rstrip(b"\x00")
+        raw_bytes = self._unpad(os.read(fd, abe_header_len))
         printDebug("_read_metadata", "length of raw c1: {}".format(len(raw_bytes)))
         c1 = self._abe.fromBytes(raw_bytes)
 
         # Read IV data.
-        raw_bytes = os.read(fd, 4096).rstrip(b"\x00")
+        raw_bytes = self._unpad(os.read(fd, 4096))
         IVs = []
         for i in range(0, len(raw_bytes), 16):
             IVs.append(raw_bytes[i: i + 16])
@@ -71,7 +63,7 @@ class ABEFS(Operations):
         printDebug("_read_metadata", "IV len {}".format(len(IVs)))
 
         # Read tag data.
-        raw_bytes = os.read(fd, 4096).rstrip(b"\x00")
+        raw_bytes = self._unpad(os.read(fd, 4096))
         MACs = []
         for i in range(0, len(raw_bytes), 16):
             MACs.append(raw_bytes[i: i + 16])
@@ -80,20 +72,58 @@ class ABEFS(Operations):
         MACs += [b"\x00" * 16] * (256 - tag_len % 256)
         printDebug("_read_metadata", "tag len {}".format(len(MACs)))
 
-        return {"c1": c1, "IV": IVs, "tags": MACs}
+        return {"c1": c1, "IV": IVs, "tags": MACs, "header_len": abe_header_len}
 
     # Writes metadata to a file.
     def _write_metadata(self, fd):
         pass
 
-    # Zero pad.
+    # Padding based on ANSIX923 and PKCS7.
     def _pad(self, obj):
         size = len(obj)
 
-        return obj + bytes(4096 - size % 4096)
+        if size % 4096:
+            pad_len = 4096 - (size % 4096)
+
+            # Do ANSIX923 like padding but using the last two bytes to store the size.
+            if pad_len > 2:
+                pad = bytes(4096 - (size % 4096) - 2)
+                pad += len(pad).to_bytes(2, byteorder = "big")
+            # Otherwise, do a PKCS7 like padding with the last one or two bytes.
+            elif pad_len == 2:
+                pad = b"\x02\x02"
+            else:
+                pad = b"\x01"
+
+            return obj + pad
+        # If a full block in length, don't pad.
+        else:
+            return obj
+
+    def _unpad(self, obj):
+        # Attempt to detect our ANSIX923 like padding.
+        pad_len = int.from_bytes(obj[-2:], byteorder = "big")
+        printDebug("_unpad", "pad_len: {}".format(pad_len))
+        pad = set(list(obj[-(pad_len + 2):-2]))
+        if len(pad) == 1 and 0 in pad:
+            printDebug("_unpad", "found ANSIX923 like padding")
+            return obj[:-(pad_len + 2)]
+
+        # Otherwise, try to detect our PKCS7 like padding.
+        pad_len = obj[-1]
+        if pad_len == 2 and int.from_bytes(obj[-2:-1], byteorder = "big") == 2:
+            printDebug("_unpad", "last 2 bytes are pad")
+            return obj[:-2]
+        elif pad_len == 1:
+            printDebug("_unpad", "last byte is pad")
+            return obj[:-1]
+
+        printDebug("_unpad", "no padding detected")
+        # No padding detected, return the object as is.
+        return obj
 
     # Create adjusted file offset and size.
-    def _calc_offsets(self, offset, size):
+    def _calc_offsets(self, offset, size, path):
         # Calculate how many bytes to ignore from the beginning of the first extent.
         first = offset % 4096
 
@@ -105,8 +135,8 @@ class ABEFS(Operations):
 
         # Generate new offset.
         # FIXME: correct this for files over 256 extents in size.
-        header_len = self._header_len + 2 * 4096
-        offset = offset - (offset % 4096) + header_len
+        header_len = self._file_cache[path]["header_len"] + 2 * 4096
+        offset = offset - (offset % 4096) + header_len + 8
 
         # Adjust size to a multiple of a full extent.
         if size % 4096 == 0:
@@ -124,8 +154,10 @@ class ABEFS(Operations):
         st = os.lstat(path)
         attrs = dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
                 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
-        attrs["st_size"] -= self._header_len + 2 * 4096
-        #printDebug("getattr", "attributes of {}: {}".format(path, attrs))
+        try:
+            attrs["st_size"] -= self._file_cache[path]["header_len"] + 2 * 4096
+        except:
+            attrs["st_size"] -= 3 * 4096
         return attrs
 
     # Read the target of a symbolic link.
@@ -218,7 +250,7 @@ class ABEFS(Operations):
         e = int(offset / 4096)
 
         # Adjust offset to account for cryptographic metadata, seek, and read.
-        offset, new_size, first, last = self._calc_offsets(offset, size)
+        offset, new_size, first, last = self._calc_offsets(offset, size, path)
         printDebug("read", "adjusted offset: {}".format(offset))
         printDebug("read", "adjusted size: {}".format(new_size))
         printDebug("read", "first: {}".format(first))
@@ -238,12 +270,20 @@ class ABEFS(Operations):
             tag = self._file_cache[path]["tags"][e + i]
             printDebug("read", "tag length: {}".format(len(tag)))
             printDebug("read", "tag: {}".format(tag))
+            #printDebug("read", "ct: {}".format(b[i:i + 4096]))
 
             # Perform decryption
-            msg = self._abe.decrypt(key, c1, b[i:i + 4096], iv, tag)
+            plain = self._abe.decrypt(key, c1, b[i:i + 4096], iv, tag)
+            if not plain:
+                break
+
+            # Remove padding if last block.
+            if i == num_extents -1:
+                msg = self._unpad(plain)
 
             # Store message in both list to be returned and the cache.
             plaintexts.append(msg)
+            printDebug("read", "decrypted msg: {}".format(msg))
             self._file_cache[path][e + i] = msg
 
         # Adjust plaintext to contain only what was requested.
@@ -277,7 +317,7 @@ class ABEFS(Operations):
         printDebug("write", "e: {}".format(e))
 
         # Calculate new offset and seek.
-        offset, new_size, first, last = self._calc_offsets(offset, len(data))
+        offset, new_size, first, last = self._calc_offsets(offset, len(data), path)
         os.lseek(fd, offset, os.SEEK_SET) 
         printDebug("write", "new offset: {}".format(offset))
         printDebug("write", "new size: {}".format(new_size))
@@ -317,14 +357,21 @@ class ABEFS(Operations):
                 self._file_cache[path]["cache"].append(data_list[i])
 
             # Encrypt extent.
-            c, iv, tag = self._abe.encrypt(data_list[i], key, c1)
+            if len(data_list[i]) % 4096:
+                c, iv, tag = self._abe.encrypt(self._pad(data_list[i]), key, c1)
+            else:
+                c, iv, tag = self._abe.encrypt(data_list[i], key, c1)
+            #printDebug("write", "ct: {}".format(c))
             printDebug("write", "length of tag: {}".format(len(tag)))
             printDebug("write", "tag: {}".format(tag))
             ciphertexts.append(c)
+            printDebug("write", "length of ct: {}".format(len(c)))
             self._file_cache[path]["IV"][e + i] = iv
             self._file_cache[path]["tags"][e + i] = tag
 
-        return os.write(fd, b"".join(ciphertexts))
+        c = b"".join(ciphertexts)
+        printDebug("write", "ct len: {}".format(len(c)))
+        return os.write(fd, c)
 
     # Get filesystem statistics.
     def statfs(self, path):
@@ -349,11 +396,21 @@ class ABEFS(Operations):
         printDebug("release", "releasing {}".format(path))
         os.lseek(fd, 0, os.SEEK_SET)
 
-        c1 = self._pad(self._abe.toBytes(self._file_cache[path]["c1"]))
-        printDebug("release", "length of c1: {}".format(len(self._abe.toBytes(self._file_cache[path]["c1"]))))
+        c1 = self._abe.toBytes(self._file_cache[path]["c1"])
+        #c1_len = ceil((len(c1) + 8) / 4096.0)
+        c1_len = self._file_cache[path]["header_len"]
+        printDebug("release", "header_len: {}".format(c1_len))
+        assert c1_len * 4096 >= len(c1)
+        c1 = self._pad(c1_len.to_bytes(8, byteorder = "big") + c1)
+        printDebug("release", "length of c1 + 8: {}".format(len(c1)))
+        #printDebug("release", "IVs: {}".format(self._file_cache[path]["IV"]))
+        #printDebug("release", "tags: {}".format(self._file_cache[path]["tags"]))
         IVs = self._pad(b"".join(self._file_cache[path]["IV"]))
         tags = self._pad(b"".join(self._file_cache[path]["tags"]))
 
+        printDebug("release", "length of IVs ({}): {}".format(path, len(IVs)))
+        printDebug("release", "length of tags({}): {}".format(path, len(tags)))
+        printDebug("release", "header size: {}".format(len(c1 + IVs + tags)))
         os.write(fd, c1 + IVs + tags)
         del self._file_cache[path]
 
@@ -437,6 +494,9 @@ class ABEFS(Operations):
                                   "IV": [b"\x00" * 16] * 16,
                                   "tags": [b"\x00" * 16] * 16}
         self._file_cache[path]["cache"] = []
+        header_len = len(self._pad(self._abe.toBytes(c1) + b"\x00" * 8)) - 8
+        self._file_cache[path]["header_len"] = header_len
+        printDebug("create", "header_len: {}".format(header_len))
 
         return os.open(path, os.O_WRONLY | os.O_CREAT, mode)
 
@@ -487,7 +547,8 @@ class ABEFS(Operations):
 
 # Helper functions.
 def printDebug(op, msg):
-    print("[DEBUG {}]: {}".format(op, msg))
+    if DEBUG:
+        print("[DEBUG {}]: {}".format(op, msg))
 
 def print_usage():
     print("Usage: {}".format(sys.arv[0]))
