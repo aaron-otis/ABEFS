@@ -27,7 +27,7 @@ class ABEFS(Operations):
         self._abe = ABECrypto()
         self._user_cache = {}
         self._file_cache = {}
-        self._header_len = 4096
+        self._header_len = 4096 # TODO: Use a variable header length per file.
 
     # Creates a path relative to the specified root.
     def _full_path(self, path):
@@ -93,14 +93,28 @@ class ABEFS(Operations):
         return obj + bytes(4096 - size % 4096)
 
     # Create adjusted file offset and size.
-    def _adjust_offset_size(self, offset, size):
-        # Generate new offset. FIXME: correct this for files over 256 extents in size.
-        offset = offset + self._header_len + 2 * 4096
+    def _calc_offsets(self, offset, size):
+        # Calculate how many bytes to ignore from the beginning of the first extent.
+        first = offset % 4096
+
+        # Calculate how many bytes to ignore from the end of the last extent.
+        if (first + size) % 4096 == 0:
+            last = 0
+        else:
+            last = 4096 - ((first + size) % 4096)
+
+        # Generate new offset.
+        # FIXME: correct this for files over 256 extents in size.
+        header_len = self._header_len + 2 * 4096
+        offset = offset - (offset % 4096) + header_len
 
         # Adjust size to a multiple of a full extent.
-        new_size = size + size % 4096
+        if size % 4096 == 0:
+            new_size = size
+        else:
+            new_size = size + 4096 - (size % 4096)
 
-        return offset, new_size
+        return offset, new_size, first, last
 
     ### File operations.
 
@@ -170,17 +184,23 @@ class ABEFS(Operations):
         # TODO: Determine if opening in write only mode will cause problems with metadata.
         path = self._full_path(path)
         printDebug("open", "opening {} with flags {}".format(path, flags))
+
         fd = os.open(path, flags)
+        # Open in read only mode to read metadata.
+        #fd = os.open(path, os.O_RDONLY)
 
         # Setup file context in the cache.
         self._file_cache[path] = self._read_metadata(fd)
-        self._file_cache[path]["cache"] = {}
+        self._file_cache[path]["cache"] = []
+
+        # Close and re-open file with correct flags.
+        #os.close(fd)
 
         return fd
 
     # Read from a file.
     def read(self, path, size, offset, fd):
-        # Get user's key and preform decryption on the contents of fd.
+        path = self._full_path(path)
         printDebug("read", "reading {} bytes from {} (fd {}) at offset {}".format(size, path, fd, offset))
 
         # TODO: Determine attributes in a better way, maybe like eCryptfs.
@@ -192,30 +212,51 @@ class ABEFS(Operations):
         key = self._user_cache[user]["key"]
 
         # Fetch the encrypted AES key.
-        c1 = self._file_cache[self._full_path(path)]["c1"]
+        c1 = self._file_cache[path]["c1"]
 
-        offset, new_size = self._adjust_offset_size(offset, size)
+        # Calculate the first extent to read based on the offset.
+        e = int(offset / 4096)
+
+        # Adjust offset to account for cryptographic metadata, seek, and read.
+        offset, new_size, first, last = self._calc_offsets(offset, size)
         printDebug("read", "adjusted offset: {}".format(offset))
+        printDebug("read", "adjusted size: {}".format(new_size))
+        printDebug("read", "first: {}".format(first))
+        printDebug("read", "last: {}".format(last))
         os.lseek(fd, offset, os.SEEK_SET)
         b = os.read(fd, new_size)
 
         # Process read data, decrypting each read extent.
         plaintexts = []
-        e = int(size / 4096) # The number of the first extent to be read.
         printDebug("read", "e: {}".format(e))
         num_extents = ceil(new_size / 4096.0)
+
         for i in range(num_extents):
-            printDebug("read", "index: {}".format(e * i))
-            iv = self._file_cache[self._full_path(path)]["IV"][e * i]
-            tag = self._file_cache[self._full_path(path)]["tags"][e * i]
+            printDebug("read", "index: {}".format(e + i))
+            # Get IV and tag for extent e + i.
+            iv = self._file_cache[path]["IV"][e + i]
+            tag = self._file_cache[path]["tags"][e + i]
             printDebug("read", "tag length: {}".format(len(tag)))
             printDebug("read", "tag: {}".format(tag))
-            plaintexts.append(self._abe.decrypt(key, c1, b[i:i + 4096], iv, tag))
 
-        return b"".join(plaintexts)
+            # Perform decryption
+            msg = self._abe.decrypt(key, c1, b[i:i + 4096], iv, tag)
+
+            # Store message in both list to be returned and the cache.
+            plaintexts.append(msg)
+            self._file_cache[path][e + i] = msg
+
+        # Adjust plaintext to contain only what was requested.
+        p = b"".join(plaintexts)
+        p = p[first:] # Drop unrequested bytes at beginning.
+        if last:
+            p = p[:-last] # Drop unrequested bytes at end.
+        printDebug("read", "requested {} bytes, returning {} bytes".format(size, len(p)))
+        return p
 
     # Write to a file.
     def write(self, path, data, offset, fd):
+        path = self._full_path(path)
         printDebug("write", "writing to {} (fd {}) at offset {}".format(path, fd, offset))
         printDebug("write", "writing {} bytes".format(len(data)))
 
@@ -229,26 +270,59 @@ class ABEFS(Operations):
         policy = self._user_cache[user]["policy"]
 
         # Fetch the encrypted AES key.
-        c1 = self._file_cache[self._full_path(path)]["c1"]
+        c1 = self._file_cache[path]["c1"]
 
-        offset, new_size = self._adjust_offset_size(offset, len(data))
+        # Calculate the first extent to read based on the offset.
+        e = int(offset / 4096)
+        printDebug("write", "e: {}".format(e))
+
+        # Calculate new offset and seek.
+        offset, new_size, first, last = self._calc_offsets(offset, len(data))
         os.lseek(fd, offset, os.SEEK_SET) 
         printDebug("write", "new offset: {}".format(offset))
+        printDebug("write", "new size: {}".format(new_size))
+
+        # Prepare data to be written to the cache. Prepend the missing bytes of
+        # the first extent and append the missing bytes of the last extent from
+        # the cache.
+        num_extents = int(ceil(new_size / 4096.0))
+        printDebug("write", "# of extents: {}".format(num_extents))
+        try:
+            prepend = self._file_cache[path][e][:first + 1]
+        except KeyError:
+            prepend = b""
+
+        try:
+            append = self._file_cache[path][e + num_extents][-last]
+        except KeyError:
+            append = b""
+
+        data = prepend + data + append
+        printDebug("write", "new length of data: {}".format(len(data)))
+        #assert len(data) % 4096 == 0 # Ensure I'm not breaking everything...
+        data_list = [data[i:i+4096] for i in range(0, len(data), 4096)]
 
         # Encrypt each extent.
         ciphertexts = []
-        e = offset / 4096.0 - 3
-        printDebug("write", "e: {}".format(e))
-        e = int(e)
-        num_extents = int(ceil(new_size / 4096.0))
         for i in range(num_extents):
             printDebug("write", "index: {}".format(e + i))
-            c, iv, tag = self._abe.encrypt(data[e: e + 4096], key, c1)
+            # Write to cache.
+            try:
+                self._file_cache[path]["cache"][e + i] = data_list[i]
+            except IndexError:
+                cachelen = len(self._file_cache[path]["cache"])
+                printDebug("write", "cache size {} and index {}".format(cachelen,
+                                                                        e + i))
+                assert cachelen == e + i
+                self._file_cache[path]["cache"].append(data_list[i])
+
+            # Encrypt extent.
+            c, iv, tag = self._abe.encrypt(data_list[i], key, c1)
             printDebug("write", "length of tag: {}".format(len(tag)))
             printDebug("write", "tag: {}".format(tag))
             ciphertexts.append(c)
-            self._file_cache[self._full_path(path)]["IV"][e + i] = iv
-            self._file_cache[self._full_path(path)]["tags"][e + i] = tag
+            self._file_cache[path]["IV"][e + i] = iv
+            self._file_cache[path]["tags"][e + i] = tag
 
         return os.write(fd, b"".join(ciphertexts))
 
@@ -362,6 +436,7 @@ class ABEFS(Operations):
         self._file_cache[path] = {"c1": c1,
                                   "IV": [b"\x00" * 16] * 16,
                                   "tags": [b"\x00" * 16] * 16}
+        self._file_cache[path]["cache"] = []
 
         return os.open(path, os.O_WRONLY | os.O_CREAT, mode)
 
