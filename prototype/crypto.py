@@ -90,12 +90,13 @@ def main():
     abe = ABECrypto()
 
     # Policies and attribute list elements must be uppercase for some reason.
-    policy = "(ME or YOU or 42)"
+    policy = "(ME or YOU or 42 or GID1000 or GID0)"
 
     # Test several keys with different attributes.
     keys = [abe.get_secret_key(["ME"]), abe.get_secret_key(["YOU"]), 
             abe.get_secret_key(["YOU", "US"]), abe.get_secret_key(["US"]),
-            abe.get_secret_key(["ME", "YOU"]), abe.get_secret_key(["42"])]
+            abe.get_secret_key(["ME", "YOU"]), abe.get_secret_key(["42"]),
+            abe.get_secret_key(["GID1000"]), abe.get_secret_key(["GID1"])]
 
     msg = b"a test message"
     c1 = abe.genAESKey(policy)
