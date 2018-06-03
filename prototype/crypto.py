@@ -58,9 +58,12 @@ class ABECrypto:
             print("[ERROR] Unable to decrypt AES key")
             return None
 
-        decryptor = Cipher(algorithms.AES(sha256(self.toBytes(g)).digest()),
-                           modes.GCM(iv, tag),
-                           backend = default_backend()).decryptor()
+        try:
+            decryptor = Cipher(algorithms.AES(sha256(self.toBytes(g)).digest()),
+                               modes.GCM(iv, tag),
+                               backend = default_backend()).decryptor()
+        except TypeError:
+            return None
 
         if associated_data:
             decryptor.authenticate_additional_data(associated_data)
