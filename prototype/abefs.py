@@ -1,7 +1,8 @@
 # Version 0.3
 
-import os, sys, errno
-from fuse import FUSE, FuseOSError, Operations
+from __future__ import print_function
+import os, sys, errno, json
+from fuse import FUSE, FuseOSError, Operations, fuse_get_context
 from crypto import ABECrypto
 from pwd import getpwuid
 from json import dumps, loads
@@ -16,6 +17,17 @@ class ABEFS(Operations):
         self._abe = ABECrypto()
         self._user_cache = {}
         self._file_cache = {}
+
+        # Open default policy file.
+        try:
+            printDebug("__init__", "opening {}".format(root + "/.policy"))
+            policy_file = open(root + "/.policy")
+        except IOError:
+            print("No policy file detected. Create a policy file in '" + root + "'",
+                  file = sys.stderr)
+            sys.exit(1)
+
+        self._policy = policy_file.read()
 
     # Creates a path relative to the specified root.
     def _full_path(self, path):
@@ -32,12 +44,10 @@ class ABEFS(Operations):
     # Automatically generates a list of attributes and a secret key for a user.
     # FIXME: Attributes should be specified externally from the filesystem.
     def _generate_user_attr(self):
-        user = self._getusername()
-        uid = str(os.getuid())
-        attr_list = [uid]
-        self._user_cache[user] = {"attr": attr_list, 
-                                  "key": self._abe.get_secret_key(attr_list),
-                                  "policy": "({} or 0)".format(uid)}
+        uid, gid, pid = fuse_get_context()
+        attr_list = ["UID" + str(uid), "GID" + str(gid)]
+        self._user_cache[uid] = {"attr": attr_list, 
+                                  "key": self._abe.get_secret_key(attr_list)}
 
     # Read the first block of a file to get its ABE metatdata.
     def _read_metadata(self, fd):
@@ -81,14 +91,17 @@ class ABEFS(Operations):
     # Padding based on ANSIX923 and PKCS7.
     def _pad(self, obj):
         size = len(obj)
+        printDebug("_pad", "size of obj: {}".format(size))
 
         if size % 4096:
             pad_len = 4096 - (size % 4096)
+            printDebug("_pad", "pad_len: {}".format(pad_len))
 
             # Do ANSIX923 like padding but using the last two bytes to store the size.
             if pad_len > 2:
                 pad = bytes(4096 - (size % 4096) - 2)
                 pad += len(pad).to_bytes(2, byteorder = "big")
+                assert(len(pad) + size == 4096)
             # Otherwise, do a PKCS7 like padding with the last one or two bytes.
             elif pad_len == 2:
                 pad = b"\x02\x02"
@@ -104,6 +117,7 @@ class ABEFS(Operations):
         # Attempt to detect our ANSIX923 like padding.
         pad_len = int.from_bytes(obj[-2:], byteorder = "big")
         printDebug("_unpad", "pad_len: {}".format(pad_len))
+        printDebug("_unpad", "len of obj: {}".format(len(obj)))
         pad = set(list(obj[-(pad_len + 2):-2]))
         if len(pad) == 1 and 0 in pad:
             printDebug("_unpad", "found ANSIX923 like padding")
@@ -146,6 +160,17 @@ class ABEFS(Operations):
 
         return offset, new_size, first, last
 
+    def _read_policy_file(self, directory):
+        if os.path.isdir(directory):
+            try:
+                f = open(directory + "/.policy")
+            except IOError:
+                return self._policy
+
+            return f.read()
+
+        return self._policy
+
     ### File operations.
 
     # Get file attributes.
@@ -155,7 +180,7 @@ class ABEFS(Operations):
         attrs = dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
                 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
         try:
-            attrs["st_size"] -= self._file_cache[path]["header_len"] + 2 * 4096
+            attrs["st_size"] -= self._file_cache[path]["header_len"] + 2 * 4096 + 8
         except:
             attrs["st_size"] -= 3 * 4096
         return attrs
@@ -233,15 +258,16 @@ class ABEFS(Operations):
     # Read from a file.
     def read(self, path, size, offset, fd):
         path = self._full_path(path)
+        uid, gid, pid = fuse_get_context()
         printDebug("read", "reading {} bytes from {} (fd {}) at offset {}".format(size, path, fd, offset))
+        printDebug("read", uid)
+        printDebug("read", gid)
 
-        # TODO: Determine attributes in a better way, maybe like eCryptfs.
-        user = self._getusername()
-        if user not in self._user_cache:
+        if uid not in self._user_cache:
             self._generate_user_attr()
 
         # Fetch user's cached key.
-        key = self._user_cache[user]["key"]
+        key = self._user_cache[uid]["key"]
 
         # Fetch the encrypted AES key.
         c1 = self._file_cache[path]["c1"]
@@ -273,13 +299,17 @@ class ABEFS(Operations):
             #printDebug("read", "ct: {}".format(b[i:i + 4096]))
 
             # Perform decryption
-            plain = self._abe.decrypt(key, c1, b[i:i + 4096], iv, tag)
-            if not plain:
+            msg = self._abe.decrypt(key, c1, b[i:i + 4096], iv, tag)
+            if not msg:
+                # Attempt to unpad last block before breaking out of loop.
+                if i > 0:
+                    plaintexts[i] = self._unpad(plaintexts[i])
+
                 break
 
             # Remove padding if last block.
             if i == num_extents -1:
-                msg = self._unpad(plain)
+                msg = self._unpad(msg)
 
             # Store message in both list to be returned and the cache.
             plaintexts.append(msg)
@@ -300,14 +330,13 @@ class ABEFS(Operations):
         printDebug("write", "writing to {} (fd {}) at offset {}".format(path, fd, offset))
         printDebug("write", "writing {} bytes".format(len(data)))
 
-        # TODO: Determine attributes in a better way, maybe like eCryptfs.
-        user = self._getusername()
-        if user not in self._user_cache:
+        uid, gid, pid = fuse_get_context()
+        if uid not in self._user_cache:
             self._generate_user_attr()
 
         # Fetch user's cached key and policy.
-        key = self._user_cache[user]["key"]
-        policy = self._user_cache[user]["policy"]
+        key = self._user_cache[uid]["key"]
+        policy = self._read_policy_file(path)
 
         # Fetch the encrypted AES key.
         c1 = self._file_cache[path]["c1"]
@@ -356,11 +385,13 @@ class ABEFS(Operations):
                 assert cachelen == e + i
                 self._file_cache[path]["cache"].append(data_list[i])
 
+            #printDebug("write", "msg: {}".format(data_list[i]))
             # Encrypt extent.
             if len(data_list[i]) % 4096:
                 c, iv, tag = self._abe.encrypt(self._pad(data_list[i]), key, c1)
             else:
                 c, iv, tag = self._abe.encrypt(data_list[i], key, c1)
+
             #printDebug("write", "ct: {}".format(c))
             printDebug("write", "length of tag: {}".format(len(tag)))
             printDebug("write", "tag: {}".format(tag))
@@ -371,6 +402,7 @@ class ABEFS(Operations):
 
         c = b"".join(ciphertexts)
         printDebug("write", "ct len: {}".format(len(c)))
+        os.fsync(fd)
         return os.write(fd, c)
 
     # Get filesystem statistics.
@@ -387,7 +419,6 @@ class ABEFS(Operations):
     def flush(self, path, fd):
         path = self._full_path(path)
         printDebug("flush", "flushing {} (fd {})".format(path, fd))
-        # FIXME: write all metadata to file before calling fsync!
         return os.fsync(fd)
 
     # Release an open file.
@@ -451,6 +482,9 @@ class ABEFS(Operations):
         if os.path.isdir(path):
             dirents.extend(os.listdir(path))
 
+        # Remove policy file so it is not seen.
+        dirents = [x for x in dirents if x != ".policy"]
+
         for r in dirents:
             yield r
 
@@ -487,7 +521,7 @@ class ABEFS(Operations):
         if user not in self._user_cache:
             self._generate_user_attr()
 
-        policy = self._user_cache[user]["policy"]
+        policy = self._read_policy_file(path)
         c1 = self._abe.genAESKey(policy)
         printDebug("create", "length of c1: {}".format(len(c1)))
         self._file_cache[path] = {"c1": c1,
@@ -556,7 +590,7 @@ def print_usage():
 
 # main function.
 def main(mountpoint, root):
-    FUSE(ABEFS(root), mountpoint, nothreads = True, foreground = True)
+    FUSE(ABEFS(root), mountpoint, nothreads = True, foreground = True, allow_other = True)
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
